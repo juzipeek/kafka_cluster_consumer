@@ -1,0 +1,7 @@
+{
+  "PartionGroup": "demo_group",
+  "BrokersAddr": "127.0.0.1:9092",
+  "Topics": "demo",
+  "MessageCount": 50000,
+  "NumProcessRoutine": 50
+}
