@@ -18,10 +18,19 @@ import (
 
 // 消息处理协程启动参数
 type ProcInfo struct {
-	routineId int            // 协程编号
-	msgChan   chan []byte    // kafka 消息队列
-	exitChan  chan int32     // 协程退出 channel
-	wg        sync.WaitGroup //
+	routineId int                          // 协程编号
+	msgChan   chan *sarama.ConsumerMessage // kafka 消息队列
+	exitChan  chan int32                   // 协程退出 channel
+	wg        *sync.WaitGroup              //
+}
+
+// consumer 协程启动参数
+type ConsumerInfo struct {
+	ProcInfo
+	group   string   // 消费组
+	brokers []string //
+	topics  []string
+	config  *cluster.Config
 }
 
 // 处理消息
@@ -32,12 +41,53 @@ func ProcMessage(info ProcInfo) {
 	for {
 		select {
 		case msg := <-info.msgChan:
-			seelog.Debugf("routine[%d] recive msg, len:%d", info.routineId, len(msg))
+			seelog.Debugf("routine[%d] recive msg, len:%d", info.routineId, len(msg.Value))
 		case <-info.exitChan:
-			seelog.Debugf("routine[%d] exit", info.routineId)
+			seelog.Debugf("message proc routine[%d] exit", info.routineId)
 			return
 		}
 	}
+}
+
+// consumer 协程
+func ConsumerProcess(info ConsumerInfo) {
+	info.wg.Add(1)
+	defer info.wg.Done()
+
+	consumer, err := cluster.NewConsumer(info.brokers, info.group, info.topics, info.config)
+	if err != nil {
+		seelog.Errorf("NewConsumer error:%s", err.Error())
+		return
+	}
+	defer consumer.Close()
+
+	// consume errors
+	go func() {
+		for err := range consumer.Errors() {
+			seelog.Errorf("Error: %s", err.Error())
+		}
+	}()
+
+	// consume notifications
+	go func() {
+		for ntf := range consumer.Notifications() {
+			seelog.Errorf("Rebalanced: %+v", ntf)
+		}
+	}()
+
+LABEL_CONSUMER_LOOP:
+	for {
+		select {
+		case msg, ok := <-consumer.Messages():
+			if ok {
+				info.msgChan <- msg
+			}
+		case <-info.exitChan:
+			seelog.Debugf("consumer routine[%d] exit", info.routineId)
+			break LABEL_CONSUMER_LOOP
+		}
+	}
+
 }
 
 func main() {
@@ -57,12 +107,13 @@ func main() {
 	seelog.Debugf("AppConf[%+v]", consumerConf)
 
 	var waitGroup sync.WaitGroup
-	msgChannel := make(chan []byte, 2000)
+
+	allMessage := make(chan *sarama.ConsumerMessage, consumerConf.NumConsumerRoutine*20)
 	sigChannel := make(chan int32, consumerConf.NumProcessRoutine)
 
 	// 启动消息处理协程
 	for i := 0; i < consumerConf.NumProcessRoutine; i++ {
-		procInfo := ProcInfo{routineId: i, msgChan: msgChannel, exitChan: sigChannel, wg: waitGroup}
+		procInfo := ProcInfo{routineId: i, msgChan: allMessage, exitChan: sigChannel, wg: &waitGroup}
 		go ProcMessage(procInfo)
 	}
 
@@ -97,57 +148,38 @@ func main() {
 	brokers := strings.Split(consumerConf.BrokersAddr, ",")
 	topics := strings.Split(consumerConf.Topics, ",")
 
-	consumer, err := cluster.NewConsumer(brokers, "my-consumer-group", topics, config)
-	if err != nil {
-		seelog.Errorf("NewConsumer error:%s", err.Error())
-		return
+	// consumer 退出信号
+	consumerExitSignal := make(chan int32, consumerConf.NumConsumerRoutine)
+	// 启动 consumer 协程
+	for i := 0; i < consumerConf.NumConsumerRoutine; i++ {
+		consumerInfo := ConsumerInfo{ProcInfo: ProcInfo{routineId: i, msgChan: allMessage, exitChan: consumerExitSignal,
+			wg: &waitGroup}, group: consumerConf.PartionGroup, brokers: brokers, topics: topics, config: config}
+		go ConsumerProcess(consumerInfo)
+		//go ProcMessage(procInfo)
 	}
-	defer consumer.Close()
 
 	// trap SIGINT to trigger a shutdown.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
 
-	// consume errors
-	go func() {
-		for err := range consumer.Errors() {
-			seelog.Errorf("Error: %s", err.Error())
-		}
-	}()
-
-	// consume notifications
-	go func() {
-		for ntf := range consumer.Notifications() {
-			seelog.Errorf("Rebalanced: %+v", ntf)
-		}
-	}()
-
-	// consume messages, watch signals
-	var hasConsumed uint64 = 0
 LABEL_MAIN_LOOP:
 	for {
 		select {
-		case msg, ok := <-consumer.Messages():
-			if ok {
-				hasConsumed++
-				seelog.Debugf("Topic[%s]Partion[%d]Offset[%d]Key[%s]", msg.Topic, msg.Partition, msg.Offset, msg.Key)
-				msgChannel <- msg.Value
-				// consumer.MarkOffset(msg, "") // mark message as processed
-				if hasConsumed >= consumerConf.MessageCount {
-					seelog.Debugf("has read message:%d, exit now", hasConsumed)
-					break LABEL_MAIN_LOOP
-				}
-			}
 		case <-signals:
 			break LABEL_MAIN_LOOP
 		}
+	}
+
+	// 向 consumer 协程发送退出信号
+	for i := 0; i < consumerConf.NumConsumerRoutine; i++ {
+		consumerExitSignal <- 1
 	}
 
 	// 向消息处理协程发送退出信号
 	for i := 0; i < consumerConf.NumProcessRoutine; i++ {
 		sigChannel <- 1
 	}
-	seelog.Debugf("wait routine exit!")
+	seelog.Debugf("wait all routine exit!")
 	waitGroup.Wait()
 
 	seelog.Debugf("proc end.")

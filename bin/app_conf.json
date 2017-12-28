@@ -1,7 +1,8 @@
 {
-  "PartionGroup": "demo_group",
+  "PartionGroup": "go_group_1",
   "BrokersAddr": "127.0.0.1:9092",
-  "Topics": "demo",
-  "MessageCount": 50000,
-  "NumProcessRoutine": 50
+  "Topics": "demo_python_4",
+  "MessageCount": 10,
+  "NumProcessRoutine": 50,
+  "NumConsumerRoutine": 64
 }

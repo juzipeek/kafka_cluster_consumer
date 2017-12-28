@@ -38,7 +38,7 @@ func LogInit() {
 			</buffered>
 		</outputs>
 		<formats>
-			<format id="main" format="%Time|%LEV|%File|%Line|%Msg%n"/>
+			<format id="main" format="%Time|%Ns|%LEV|%File|%Line|%Msg%n"/>
 		</formats>
 	</seelog>`
 
